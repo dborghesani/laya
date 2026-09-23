@@ -96,9 +96,12 @@ def gpu_metrics(device: torch.device) -> dict[str, float]:
 	metrics = {
 		"memory_allocated_gb": torch.cuda.memory_allocated(device) / 1024 ** 3,
 		"memory_reserved_gb": torch.cuda.memory_reserved(device) / 1024 ** 3,
+		"max_memory_allocated_gb": torch.cuda.max_memory_allocated(device) / 1024 ** 3,
 	}
-	visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
-	gpu_id = visible_devices[device.index or 0].strip() if visible_devices else str(device.index or 0)
+	device_index = device.index or 0
+	visible_devices = [value.strip() for value in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+					   if value.strip()]
+	gpu_id = visible_devices[device_index] if device_index < len(visible_devices) else str(device_index)
 	try:
 		result = subprocess.run(
 			["nvidia-smi", f"--id={gpu_id}",
@@ -352,6 +355,7 @@ def train(
 					writer.add_scalar("train/lr_head", metrics["lr_head"], global_step)
 					for name, value in gpu_metrics(device).items():
 						writer.add_scalar(f"gpu/{name}", value, global_step)
+					writer.flush()
 				elapsed = time.perf_counter() - training_start
 				eta = elapsed / global_step * (total_steps - global_step)
 				logger.info(
