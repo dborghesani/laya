@@ -15,7 +15,6 @@ import json
 import os
 import random
 import shutil
-import subprocess
 import sys
 import time
 from collections.abc import Iterable, Mapping, Sequence, Sized
@@ -36,6 +35,17 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import numpy as np
 import torch
+from pynvml import (
+	NVMLError,
+	NVML_TEMPERATURE_GPU,
+	nvmlDeviceGetHandleByIndex,
+	nvmlDeviceGetHandleByUUID,
+	nvmlDeviceGetMemoryInfo,
+	nvmlDeviceGetPowerUsage,
+	nvmlDeviceGetTemperature,
+	nvmlDeviceGetUtilizationRates,
+	nvmlInit,
+)
 from safetensors.torch import load_file, save_file
 from transformers import AutoTokenizer
 
@@ -103,24 +113,21 @@ def gpu_metrics(device: torch.device) -> dict[str, float]:
 	device_index = device.index or 0
 	visible_devices = [value.strip() for value in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
 					   if value.strip()]
-	gpu_id = visible_devices[device_index] if device_index < len(visible_devices) else str(device_index)
+	gpu_id = visible_devices[device_index] if device_index < len(visible_devices) else device_index
 	try:
-		result = subprocess.run(
-			["nvidia-smi", f"--id={gpu_id}",
-			 "--query-gpu=utilization.gpu,utilization.memory,memory.used,power.draw,temperature.gpu",
-			 "--format=csv,noheader,nounits"],
-			check=True, capture_output=True, text=True,
-		)
-		utilization, memory_utilization, memory_used, power, temperature = (
-			float(value.strip()) for value in result.stdout.splitlines()[0].split(","))
+		nvmlInit()
+		handle = (nvmlDeviceGetHandleByUUID(gpu_id.encode()) if isinstance(gpu_id, str) and gpu_id.startswith("GPU-")
+				  else nvmlDeviceGetHandleByIndex(int(gpu_id)))
+		utilization = nvmlDeviceGetUtilizationRates(handle)
+		memory = nvmlDeviceGetMemoryInfo(handle)
 		metrics.update({
-			"utilization_percent": utilization,
-			"memory_utilization_percent": memory_utilization,
-			"memory_used_mb": memory_used,
-			"power_watts": power,
-			"temperature_celsius": temperature,
+			"utilization_percent": float(utilization.gpu),
+			"memory_utilization_percent": float(utilization.memory),
+			"memory_used_mb": memory.used / 1024 ** 2,
+			"power_watts": nvmlDeviceGetPowerUsage(handle) / 1000,
+			"temperature_celsius": float(nvmlDeviceGetTemperature(handle, NVML_TEMPERATURE_GPU)),
 		})
-	except (FileNotFoundError, IndexError, subprocess.CalledProcessError, ValueError):
+	except (NVMLError, ValueError):
 		pass
 	return metrics
 
@@ -277,6 +284,7 @@ def train(
 	output_dir: str,
 	args: argparse.Namespace,
 ) -> list[float]:
+	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 	writer = None
 	if args.tensorboard:
 		writer = SummaryWriter(os.path.join(output_dir, "tensorboard"))
@@ -287,9 +295,7 @@ def train(
 	tokenizer = AutoTokenizer.from_pretrained(os.path.join(model_dir, "tokenizer"))
 	model = build_model(cfg, encoder_dir=os.path.join(model_dir, "encoder"))
 	model.load_state_dict(load_file(os.path.join(model_dir, "model.safetensors")), strict=True)
-	device = torch.device(args.device)
 	if device.type == "cuda":
-		device = torch.device("cuda", 0 if device.index is None else device.index)
 		torch.cuda.set_device(device)
 		model.encoder.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 	model.head_checkpointing = True
@@ -468,8 +474,8 @@ def evaluate(
 	dataset: Iterable[Mapping[str, Any]],
 	output_dir: str,
 	report_path: str,
-	device: str,
 ) -> dict[str, Any]:
+	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 	agent = laya.Agent(output_dir, device=device)
 	predictions, latencies = [], []
 	for row in dataset:
@@ -550,7 +556,6 @@ def main() -> None:
 	parser.add_argument("--run-name", default=None,
 						help="name of the run directory under OUTPUT; defaults to a UTC timestamp and process ID")
 	parser.add_argument("--report", default=None)
-	parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 	parser.add_argument("--epochs", type=int, default=4)
 	parser.add_argument("--batch-size", type=int, default=8)
 	parser.add_argument("--grad-accum", type=int, default=4)
@@ -611,7 +616,7 @@ def main() -> None:
 	logger.info("calibration temperatures: %s" % [round(value, 3) for value in temperatures])
 	report = args.report or os.path.join(output_dir, "benchmark_report.json")
 	logger.info("starting evaluation...")
-	evaluate(test_data, output_dir, report, args.device)
+	evaluate(test_data, output_dir, report)
 
 
 if __name__ == "__main__":
