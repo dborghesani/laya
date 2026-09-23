@@ -14,10 +14,12 @@ import glob
 import json
 import os
 import random
+import shutil
 import subprocess
 import sys
 import time
 from collections.abc import Iterable, Mapping, Sequence, Sized
+from datetime import datetime, timezone
 from typing import (
 	Any,
 	TypedDict,
@@ -270,13 +272,14 @@ def fit_temperature(predictions: Sequence[CalibrationRecord]) -> list[float]:
 
 def train(
 	items: list[TrainingItem],
+	validation_items: list[TrainingItem],
 	model_dir: str,
 	output_dir: str,
 	args: argparse.Namespace,
 ) -> list[float]:
 	writer = None
 	if args.tensorboard:
-		writer = SummaryWriter(os.path.join(output_dir, "runs"))
+		writer = SummaryWriter(os.path.join(output_dir, "tensorboard"))
 	with open(os.path.join(model_dir, "rl_agent_config.json")) as handle:
 		cfg = json.load(handle)
 	cfg.update({"gradient_checkpointing": True, "max_tokens_per_batch": args.max_tokens,
@@ -305,6 +308,36 @@ def train(
 	batches_per_epoch = (len(items) + args.batch_size - 1) // args.batch_size
 	total_steps = args.epochs * batches_per_epoch
 	training_start = time.perf_counter()
+	best_checkpoints: list[tuple[float, str]] = []
+	checkpoints_dir = os.path.join(output_dir, "checkpoints")
+
+	def save_checkpoint(name: str, validation_loss: float) -> str:
+		checkpoint_dir = os.path.join(checkpoints_dir, name)
+		os.makedirs(checkpoint_dir, exist_ok=True)
+		save_file({key: value.half().contiguous().cpu() for key, value in model.state_dict().items()},
+				  os.path.join(checkpoint_dir, "model.safetensors"))
+		with open(os.path.join(checkpoint_dir, "metadata.json"), "w") as handle:
+			json.dump({"epoch": epoch + 1, "validation_cross_entropy": validation_loss}, handle, indent=2)
+		return checkpoint_dir
+
+	def validation_cross_entropy() -> float:
+		model.eval()
+		loss_sum, item_count = 0.0, 0
+		with torch.no_grad():
+			for start in range(0, len(validation_items), args.eval_batch_size):
+				batch_items = validation_items[start:start + args.eval_batch_size]
+				batch = collate(batch_items, tokenizer.pad_token_id)
+				logits, _ = model(batch["input_ids"].to(device), batch["attention_mask"].to(device),
+								  batch["marker_pos"].to(device), batch["marker_mask"].to(device),
+								  batch["qtype"].to(device))
+				mask = batch["marker_mask"].to(device)
+				target = batch["target"].to(device)
+				loss = -(target * torch.log_softmax(logits.float().masked_fill(~mask, -1e4), -1)).sum(-1)
+				loss_sum += loss.sum().item()
+				item_count += len(batch_items)
+		model.train()
+		return loss_sum / item_count
+
 	for epoch in range(args.epochs):
 		rng.shuffle(items)
 		sigma = args.sigma_start + (args.sigma_end - args.sigma_start) * epoch / max(1, args.epochs - 1)
@@ -378,6 +411,19 @@ def train(
 				optimizer.zero_grad(set_to_none=True)
 		logger.info("epoch_complete", epoch=epoch + 1, epochs=args.epochs,
 					items=len(items), duration_seconds=time.perf_counter() - epoch_start)
+		validation_loss = validation_cross_entropy()
+		if writer is not None:
+			writer.add_scalar("validation/cross_entropy", validation_loss, epoch + 1)
+			writer.flush()
+		logger.info("validation_complete", epoch=epoch + 1, cross_entropy=round(validation_loss, 5))
+		if (epoch + 1) % args.checkpoint_every_epochs == 0:
+			save_checkpoint(f"epoch-{epoch + 1}", validation_loss)
+		best_checkpoint = save_checkpoint(f"best-epoch-{epoch + 1}", validation_loss)
+		best_checkpoints.append((validation_loss, best_checkpoint))
+		best_checkpoints.sort(key=lambda checkpoint: checkpoint[0])
+		while len(best_checkpoints) > args.save_best_limit:
+			_, checkpoint_dir = best_checkpoints.pop()
+			shutil.rmtree(checkpoint_dir)
 	if writer is not None:
 		writer.close()
 
@@ -489,6 +535,8 @@ def main() -> None:
 						help="use at most N cases from each split (useful for fast local debugging)")
 	parser.add_argument("--model", default="convaiinnovations/laya")
 	parser.add_argument("--output", default="output/laya_automotive_finetuned")
+	parser.add_argument("--run-name", default=None,
+						help="unique name for this run; defaults to a UTC timestamp and process ID")
 	parser.add_argument("--report", default=None)
 	parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 	parser.add_argument("--epochs", type=int, default=4)
@@ -509,11 +557,19 @@ def main() -> None:
 						help="write loss and GPU metrics to OUTPUT/runs for TensorBoard (default: enabled)")
 	parser.add_argument("--log-every", type=int, default=10,
 						help="record TensorBoard metrics every N batches")
+	parser.add_argument("--checkpoint-every-epochs", type=int, default=1,
+						help="save a regular checkpoint every N epochs")
+	parser.add_argument("--save-best-limit", type=int, default=3,
+						help="number of checkpoints with the lowest validation loss to retain")
 	args = parser.parse_args()
 	if args.limit is not None and args.limit < 1:
 		parser.error("--limit must be at least 1")
 	if args.log_every < 1:
 		parser.error("--log-every must be at least 1")
+	if args.checkpoint_every_epochs < 1:
+		parser.error("--checkpoint-every-epochs must be at least 1")
+	if args.save_best_limit < 1:
+		parser.error("--save-best-limit must be at least 1")
 	random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
 	logger.info(f"preparing model {args.model}...")
 	model_dir = snapshot_download(args.model)
@@ -529,13 +585,21 @@ def main() -> None:
 	logger.info(f"loaded {len(train_data)} training cases and {len(test_data)} test cases")
 	logger.info("preprocessing training data...")
 	items = preprocess(train_data, tokenizer, cfg)
+	validation_items = preprocess(test_data, tokenizer, cfg)
 	logger.info(f"preprocessed {len(items)} training decisions from {len(train_data)} cases")
+	logger.info(f"preprocessed {len(validation_items)} validation decisions from {len(test_data)} cases")
+	if not validation_items:
+		raise ValueError("The test split contains no valid decisions for checkpoint validation")
+	run_name = args.run_name or f"run-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{os.getpid()}"
+	output_dir = os.path.join(args.output, run_name)
+	if os.path.exists(output_dir):
+		raise FileExistsError(f"Run directory already exists: {output_dir}")
 	logger.info("starting training...")
-	temperatures = train(items, model_dir, args.output, args)
+	temperatures = train(items, validation_items, model_dir, output_dir, args)
 	logger.info("calibration temperatures: %s" % [round(value, 3) for value in temperatures])
-	report = args.report or os.path.join(args.output, "benchmark_report.json")
+	report = args.report or os.path.join(output_dir, "benchmark_report.json")
 	logger.info("starting evaluation...")
-	evaluate(test_data, args.output, report, args.device)
+	evaluate(test_data, output_dir, report, args.device)
 
 
 if __name__ == "__main__":
