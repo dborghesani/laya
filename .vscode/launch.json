@@ -10,9 +10,7 @@
             "request": "launch",
             "program": "scripts/finetuning.py",
             "console": "integratedTerminal",
-            "args": [
-                "--limit=1000"
-            ]
+            "args": []
         },
         {
             "name": "Python Debugger: Current File",

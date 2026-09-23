@@ -546,9 +546,9 @@ def main() -> None:
 	parser.add_argument("--limit", type=int, default=None,
 						help="use at most N cases from each split (useful for fast local debugging)")
 	parser.add_argument("--model", default="convaiinnovations/laya")
-	parser.add_argument("--output", default="output/laya_automotive_finetuned")
+	parser.add_argument("--output", default="output")
 	parser.add_argument("--run-name", default=None,
-						help="unique name for this run; defaults to a UTC timestamp and process ID")
+						help="name of the run directory under OUTPUT; defaults to a UTC timestamp and process ID")
 	parser.add_argument("--report", default=None)
 	parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 	parser.add_argument("--epochs", type=int, default=4)
@@ -566,7 +566,7 @@ def main() -> None:
 	parser.add_argument("--sigma-end", type=float, default=0.1)
 	parser.add_argument("--seed", type=int, default=42)
 	parser.add_argument("--tensorboard", action=argparse.BooleanOptionalAction, default=True,
-						help="write loss and GPU metrics to OUTPUT/runs for TensorBoard (default: enabled)")
+						help="write loss and GPU metrics to the run directory for TensorBoard (default: enabled)")
 	parser.add_argument("--log-every", type=int, default=10,
 						help="record TensorBoard metrics every N batches")
 	parser.add_argument("--checkpoint-every-epochs", type=int, default=1,
