@@ -283,8 +283,8 @@ def train(
 	model_dir: str,
 	output_dir: str,
 	args: argparse.Namespace,
+	device: torch.device,
 ) -> list[float]:
-	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 	writer = None
 	if args.tensorboard:
 		writer = SummaryWriter(os.path.join(output_dir, "tensorboard"))
@@ -296,7 +296,6 @@ def train(
 	model = build_model(cfg, encoder_dir=os.path.join(model_dir, "encoder"))
 	model.load_state_dict(load_file(os.path.join(model_dir, "model.safetensors")), strict=True)
 	if device.type == "cuda":
-		torch.cuda.set_device(device)
 		model.encoder.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 	model.head_checkpointing = True
 	model.to(device).train()
@@ -474,8 +473,8 @@ def evaluate(
 	dataset: Iterable[Mapping[str, Any]],
 	output_dir: str,
 	report_path: str,
+	device: torch.device,
 ) -> dict[str, Any]:
-	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 	agent = laya.Agent(output_dir, device=device)
 	predictions, latencies = [], []
 	for row in dataset:
@@ -588,6 +587,9 @@ def main() -> None:
 	if args.save_best_limit < 1:
 		parser.error("--save-best-limit must be at least 1")
 	random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
+	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+	if device.type == "cuda":
+		torch.cuda.set_device(device.index or 0)
 	logger.info(f"preparing model {args.model}...")
 	model_dir = snapshot_download(args.model)
 	_fix_tokenizer_config(model_dir)
@@ -612,11 +614,11 @@ def main() -> None:
 	if os.path.exists(output_dir):
 		raise FileExistsError(f"Run directory already exists: {output_dir}")
 	logger.info("starting training...")
-	temperatures = train(items, validation_items, model_dir, output_dir, args)
+	temperatures = train(items, validation_items, model_dir, output_dir, args, device)
 	logger.info("calibration temperatures: %s" % [round(value, 3) for value in temperatures])
 	report = args.report or os.path.join(output_dir, "benchmark_report.json")
 	logger.info("starting evaluation...")
-	evaluate(test_data, output_dir, report)
+	evaluate(test_data, output_dir, report, device)
 
 
 if __name__ == "__main__":
