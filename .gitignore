@@ -53,3 +53,4 @@ credentials.json
 *-local-command-*.txt
 
 dataset/
+output/

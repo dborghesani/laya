@@ -1,7 +1,7 @@
 """Fine-tune and evaluate Laya on a local typed-decisions dataset.
 
 Example:
-	python research/scripts/finetune.py \
+	python scripts/finetune.py \
 		--dataset dataset/laya_automotive_typed_decisions_50k \
 		--output models/laya-automotive
 
@@ -14,9 +14,19 @@ import glob
 import json
 import os
 import random
+import subprocess
 import sys
 import time
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Sized, Tuple, TypedDict, Union, cast
+from collections.abc import Iterable, Mapping, Sequence, Sized
+from typing import (
+	Any,
+	TypedDict,
+	cast,
+)
+
+import structlog
+from huggingface_hub import snapshot_download
+from torch.utils.tensorboard import SummaryWriter
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("USE_TORCH", "1")
@@ -30,20 +40,28 @@ from transformers import AutoTokenizer
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, REPO)
 
-import laya
-from laya.agent import _fix_tokenizer_config
-from laya.common import QTYPES, build_model, build_sequence, proper_reward, render_options
 from datasets import Dataset, load_dataset, load_from_disk
 
+import laya
+from laya.agent import _fix_tokenizer_config
+from laya.common import (
+	QTYPES,
+	build_model,
+	build_sequence,
+	proper_reward,
+	render_options,
+)
 
-JSONValue = Union[None, bool, int, float, str, List["JSONValue"], Dict[str, "JSONValue"]]
-State = Union[str, Dict[str, JSONValue], List[JSONValue]]
+logger = structlog.get_logger()
+
+JSONValue = bool | int | float | str | list["JSONValue"] | dict[str, "JSONValue"] | None
+State = str | dict[str, JSONValue] | list[JSONValue]
 
 
 class Question(TypedDict, total=False):
 	type: str
-	instructions: Union[str, JSONValue]
-	criteria: Union[Dict[str, JSONValue], List[JSONValue]]
+	instructions: str | JSONValue
+	criteria: dict[str, JSONValue] | list[JSONValue]
 
 
 class InternalQuestion(TypedDict):
@@ -53,10 +71,10 @@ class InternalQuestion(TypedDict):
 
 
 class TrainingItem(TypedDict):
-	ids: List[int]
-	markers: List[int]
+	ids: list[int]
+	markers: list[int]
 	qtype: int
-	target: List[float]
+	target: list[float]
 	label: int
 
 
@@ -69,24 +87,79 @@ class Batch(TypedDict):
 	qtype: torch.Tensor
 
 
-CalibrationRecord = Tuple[int, Sequence[float], Sequence[float]]
+CalibrationRecord = tuple[int, Sequence[float], Sequence[float]]
 
 
-def parse_json(value: Union[str, JSONValue]) -> Any:
+def gpu_metrics(device: torch.device) -> dict[str, float]:
+	if device.type != "cuda":
+		return {}
+	metrics = {
+		"memory_allocated_gb": torch.cuda.memory_allocated(device) / 1024 ** 3,
+		"memory_reserved_gb": torch.cuda.memory_reserved(device) / 1024 ** 3,
+	}
+	visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+	gpu_id = visible_devices[device.index or 0].strip() if visible_devices else str(device.index or 0)
+	try:
+		result = subprocess.run(
+			["nvidia-smi", f"--id={gpu_id}",
+			 "--query-gpu=utilization.gpu,utilization.memory,memory.used,power.draw,temperature.gpu",
+			 "--format=csv,noheader,nounits"],
+			check=True, capture_output=True, text=True,
+		)
+		utilization, memory_utilization, memory_used, power, temperature = (
+			float(value.strip()) for value in result.stdout.splitlines()[0].split(","))
+		metrics.update({
+			"utilization_percent": utilization,
+			"memory_utilization_percent": memory_utilization,
+			"memory_used_mb": memory_used,
+			"power_watts": power,
+			"temperature_celsius": temperature,
+		})
+	except (FileNotFoundError, IndexError, subprocess.CalledProcessError, ValueError):
+		pass
+	return metrics
+
+
+def format_duration(seconds: float) -> str:
+	seconds = max(0, int(seconds))
+	hours, remainder = divmod(seconds, 3600)
+	minutes, seconds = divmod(remainder, 60)
+	return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def temperature_closure(
+	optimizer: torch.optim.Optimizer,
+	targets: torch.Tensor,
+	logits: torch.Tensor,
+	log_temp: torch.Tensor,
+):
+	def closure():
+		optimizer.zero_grad()
+		loss = -(targets * torch.log_softmax(logits / log_temp.exp(), -1)).sum(-1).mean()
+		loss.backward()
+		return loss
+
+	return closure
+
+
+def parse_json(value: str | JSONValue) -> Any:
 	return json.loads(value) if isinstance(value, str) else value
 
 
-def load_split(path: str, split: str) -> Dataset:
+def load_split(path: str, split: str, limit: int | None = None) -> Dataset:
 	if not os.path.exists(path):
-		raise FileNotFoundError("Dataset path does not exist: %s" % path)
-	jsonl = os.path.join(path, "%s.jsonl" % split)
+		raise FileNotFoundError(f"Dataset path does not exist: {path}")
+	jsonl = os.path.join(path, f"{split}.jsonl")
 	if os.path.exists(jsonl):
+		if limit is not None:
+			with open(jsonl) as handle:
+				return Dataset.from_list([json.loads(line) for _, line in zip(range(limit), handle)])
 		return load_dataset("json", data_files={split: jsonl}, split=split)
 	try:
 		loaded = load_from_disk(path)
 		if hasattr(loaded, "keys"):
-			return loaded[split]
-		return loaded
+			loaded = loaded[split]
+		return loaded.select(range(min(limit, len(loaded)))) if limit is not None else loaded
 	except (FileNotFoundError, ValueError, KeyError):
 		pass
 
@@ -95,9 +168,11 @@ def load_split(path: str, split: str) -> Dataset:
 		split_files = [f for f in files if split in os.path.basename(f).lower()]
 		loaded = load_dataset("parquet", data_files={split: split_files or files}, split=split)
 		if split_files or "split" not in loaded.column_names:
-			return loaded
-		return loaded.filter(lambda row: row["split"] == split)
-	return load_dataset(path, split=split)
+			return loaded.select(range(min(limit, len(loaded)))) if limit is not None else loaded
+		loaded = loaded.filter(lambda row: row["split"] == split)
+		return loaded.select(range(min(limit, len(loaded)))) if limit is not None else loaded
+	loaded = load_dataset(path, split=split)
+	return loaded.select(range(min(limit, len(loaded)))) if limit is not None else loaded
 
 
 def internal_question(question: Mapping[str, Any]) -> InternalQuestion:
@@ -117,7 +192,7 @@ def training_item(
 	state: State,
 	question: Mapping[str, Any],
 	gold: Mapping[str, Any],
-) -> Optional[TrainingItem]:
+) -> TrainingItem | None:
 	q = internal_question(question)
 	probabilities = gold.get("probabilities", {})
 	if q["t"] == "choice":
@@ -128,17 +203,17 @@ def training_item(
 		target = [float(probabilities.get(str(i), 0.0)) for i in range(len(q["crit"]))]
 	total = sum(target)
 	target = [v / total for v in target] if total > 0 else [1.0 / len(target)] * len(target)
-	sequence, markers = build_sequence(tokenizer, state, cast(Dict[str, Any], q),
+	sequence, markers = build_sequence(tokenizer, state, cast(dict[str, Any], q),
 										 cfg["max_len"], cfg["head_max_len"])
-	if len(markers) != len(render_options(cast(Dict[str, Any], q))):
+	if len(markers) != len(render_options(cast(dict[str, Any], q))):
 		return None
 	return {"ids": sequence, "markers": markers, "qtype": QTYPES[q["t"]],
 			"target": target, "label": int(np.argmax(target))}
 
 
 def preprocess(dataset: Iterable[Mapping[str, Any]], tokenizer: Any,
-			   cfg: Mapping[str, Any]) -> List[TrainingItem]:
-	items: List[TrainingItem] = []
+			   cfg: Mapping[str, Any]) -> list[TrainingItem]:
+	items: list[TrainingItem] = []
 	for row in dataset:
 		state = parse_json(row["state"])
 		questions = parse_json(row["questions"])
@@ -171,7 +246,7 @@ def collate(batch: Sequence[TrainingItem], pad_id: int) -> Batch:
 			"qtype": torch.tensor([item["qtype"] for item in batch])}
 
 
-def fit_temperature(predictions: Sequence[CalibrationRecord]) -> List[float]:
+def fit_temperature(predictions: Sequence[CalibrationRecord]) -> list[float]:
 	fitted = [1.2, 1.2, 1.2]
 	for qtype in range(3):
 		selected = [(z, target) for qt, z, target in predictions if qt == qtype]
@@ -185,24 +260,20 @@ def fit_temperature(predictions: Sequence[CalibrationRecord]) -> List[float]:
 			targets[i, :len(target)] = torch.tensor(target)
 		log_temp = torch.zeros(1, requires_grad=True)
 		optimizer = torch.optim.LBFGS([log_temp], lr=0.1, max_iter=100)
-
-		def closure():
-			optimizer.zero_grad()
-			loss = -(targets * torch.log_softmax(logits / log_temp.exp(), -1)).sum(-1).mean()
-			loss.backward()
-			return loss
-
-		optimizer.step(closure)
+		optimizer.step(temperature_closure(optimizer, targets, logits, log_temp))
 		fitted[qtype] = float(torch.clamp(log_temp.exp(), 0.1, 10.0).item())
 	return fitted
 
 
 def train(
-	items: List[TrainingItem],
+	items: list[TrainingItem],
 	model_dir: str,
 	output_dir: str,
 	args: argparse.Namespace,
-) -> List[float]:
+) -> list[float]:
+	writer = None
+	if args.tensorboard:
+		writer = SummaryWriter(os.path.join(output_dir, "runs"))
 	with open(os.path.join(model_dir, "rl_agent_config.json")) as handle:
 		cfg = json.load(handle)
 	cfg.update({"gradient_checkpointing": True, "max_tokens_per_batch": args.max_tokens,
@@ -227,9 +298,14 @@ def train(
 	scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, updates, eta_min=1e-6)
 	scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 	rng = random.Random(args.seed)
+	global_step = 0
+	batches_per_epoch = (len(items) + args.batch_size - 1) // args.batch_size
+	total_steps = args.epochs * batches_per_epoch
+	training_start = time.perf_counter()
 	for epoch in range(args.epochs):
 		rng.shuffle(items)
 		sigma = args.sigma_start + (args.sigma_end - args.sigma_start) * epoch / max(1, args.epochs - 1)
+		epoch_start = time.perf_counter()
 		optimizer.zero_grad(set_to_none=True)
 		for step in range(0, len(items), args.batch_size):
 			batch_items = items[step:step + args.batch_size]
@@ -257,6 +333,36 @@ def train(
 			loss_ce = -(target * torch.log_softmax(logits.masked_fill(~mask, -1e4), -1)).sum(-1).mean()
 			loss = (loss_rl + loss_ce + 0.0 * act.sum()) / args.grad_accum
 			scaler.scale(loss).backward()
+			global_step += 1
+			if global_step % args.log_every == 0 or step + len(batch_items) >= len(items):
+				metrics = {
+					"loss_total": loss.item() * args.grad_accum,
+					"loss_rl": loss_rl.item(),
+					"loss_cross_entropy": loss_ce.item(),
+					"mean_reward": reward.mean().item(),
+					"lr_encoder": optimizer.param_groups[0]["lr"],
+					"lr_head": optimizer.param_groups[1]["lr"],
+				}
+				if writer is not None:
+					writer.add_scalar("loss/total", metrics["loss_total"], global_step)
+					writer.add_scalar("loss/rl", metrics["loss_rl"], global_step)
+					writer.add_scalar("loss/cross_entropy", metrics["loss_cross_entropy"], global_step)
+					writer.add_scalar("train/reward", metrics["mean_reward"], global_step)
+					writer.add_scalar("train/lr_encoder", metrics["lr_encoder"], global_step)
+					writer.add_scalar("train/lr_head", metrics["lr_head"], global_step)
+					for name, value in gpu_metrics(device).items():
+						writer.add_scalar(f"gpu/{name}", value, global_step)
+				elapsed = time.perf_counter() - training_start
+				eta = elapsed / global_step * (total_steps - global_step)
+				logger.info(
+					"train",
+					epoch=f"{epoch + 1}/{args.epochs}",
+					step=f"{step // args.batch_size + 1}/{batches_per_epoch}",
+					loss=round(metrics["loss_total"], 5),
+					loss_rl=round(metrics["loss_rl"], 5),
+					loss_ce=round(metrics["loss_cross_entropy"], 5),
+					eta=format_duration(eta),
+				)
 			if ((step // args.batch_size) + 1) % args.grad_accum == 0 or step + args.batch_size >= len(items):
 				scaler.unscale_(optimizer)
 				torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -266,8 +372,10 @@ def train(
 				if scaler.get_scale() >= old_scale:
 					scheduler.step()
 				optimizer.zero_grad(set_to_none=True)
-			print("step %d/%d complete" % (step + 1, len(items)), flush=True)
-		print("epoch %d/%d complete" % (epoch + 1, args.epochs), flush=True)
+		logger.info("epoch_complete", epoch=epoch + 1, epochs=args.epochs,
+					items=len(items), duration_seconds=time.perf_counter() - epoch_start)
+	if writer is not None:
+		writer.close()
 
 	model.eval()
 	calibration = []
@@ -290,6 +398,7 @@ def train(
 				"temperature": temperatures})
 	with open(os.path.join(output_dir, "rl_agent_config.json"), "w") as handle:
 		json.dump(cfg, handle, indent=2)
+	logger.info(f"finetuning complete, temperatures: {temperatures}")
 	return temperatures
 
 
@@ -298,7 +407,7 @@ def evaluate(
 	output_dir: str,
 	report_path: str,
 	device: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
 	agent = laya.Agent(output_dir, device=device)
 	predictions, latencies = [], []
 	for row in dataset:
@@ -311,7 +420,7 @@ def evaluate(
 							"gold": gold, "questions": questions})
 	accuracy, soft, brier, kl, tv, conf, correct = [], [], [], [], [], [], []
 	score_mae, within_one = [], []
-	per_workflow: Dict[str, List[float]] = {}
+	per_workflow: dict[str, list[float]] = {}
 	for item in predictions:
 		wf_correct = per_workflow.setdefault(item["workflow"], [])
 		for qid, question in item["questions"].items():
@@ -365,15 +474,17 @@ def evaluate(
 	os.makedirs(os.path.dirname(os.path.abspath(report_path)), exist_ok=True)
 	with open(report_path, "w") as handle:
 		json.dump(report, handle, indent=2)
-	print(json.dumps(report, indent=2))
+	logger.info(json.dumps(report, indent=2))
 	return report
 
 
 def main() -> None:
 	parser = argparse.ArgumentParser()
 	parser.add_argument("--dataset", default="dataset/laya_automotive_typed_decisions_50k")
+	parser.add_argument("--limit", type=int, default=None,
+						help="use at most N cases from each split (useful for fast local debugging)")
 	parser.add_argument("--model", default="convaiinnovations/laya")
-	parser.add_argument("--output", default="laya_automotive_finetuned")
+	parser.add_argument("--output", default="output/laya_automotive_finetuned")
 	parser.add_argument("--report", default=None)
 	parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 	parser.add_argument("--epochs", type=int, default=4)
@@ -390,24 +501,36 @@ def main() -> None:
 	parser.add_argument("--sigma-start", type=float, default=0.4)
 	parser.add_argument("--sigma-end", type=float, default=0.1)
 	parser.add_argument("--seed", type=int, default=42)
+	parser.add_argument("--tensorboard", action=argparse.BooleanOptionalAction, default=True,
+						help="write loss and GPU metrics to OUTPUT/runs for TensorBoard (default: enabled)")
+	parser.add_argument("--log-every", type=int, default=10,
+						help="record TensorBoard metrics every N batches")
 	args = parser.parse_args()
+	if args.limit is not None and args.limit < 1:
+		parser.error("--limit must be at least 1")
+	if args.log_every < 1:
+		parser.error("--log-every must be at least 1")
 	random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
-	model_dir = args.model
-	if not os.path.exists(model_dir):
-		from huggingface_hub import snapshot_download
-		model_dir = snapshot_download(model_dir)
+	logger.info(f"preparing model {args.model}...")
+	model_dir = snapshot_download(args.model)
 	_fix_tokenizer_config(model_dir)
 	with open(os.path.join(model_dir, "rl_agent_config.json")) as handle:
 		cfg = json.load(handle)
 	cfg.update({"max_len": args.max_len, "head_max_len": args.head_max_len})
+	logger.info("loading tokenizer...")
 	tokenizer = AutoTokenizer.from_pretrained(os.path.join(model_dir, "tokenizer"))
-	train_data = load_split(args.dataset, "train")
-	test_data = load_split(args.dataset, "test")
+	logger.info("loading dataset and preprocessing...")
+	train_data = load_split(args.dataset, "train", args.limit)
+	test_data = load_split(args.dataset, "test", args.limit)
+	logger.info(f"loaded {len(train_data)} training cases and {len(test_data)} test cases")
+	logger.info("preprocessing training data...")
 	items = preprocess(train_data, tokenizer, cfg)
-	print("preprocessed %d training decisions from %d cases" % (len(items), len(train_data)), flush=True)
+	logger.info(f"preprocessed {len(items)} training decisions from {len(train_data)} cases")
+	logger.info("starting training...")
 	temperatures = train(items, model_dir, args.output, args)
-	print("calibration temperatures: %s" % [round(value, 3) for value in temperatures], flush=True)
+	logger.info("calibration temperatures: %s" % [round(value, 3) for value in temperatures])
 	report = args.report or os.path.join(args.output, "benchmark_report.json")
+	logger.info("starting evaluation...")
 	evaluate(test_data, args.output, report, args.device)
 
 

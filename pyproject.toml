@@ -31,6 +31,9 @@ dependencies = [
     "huggingface_hub>=0.20.0",
     "numpy>=1.20.0",
     "datasets>=2.0.0",
+    "ruff",
+    "structlog",
+    "tensorboard>=2.14.0",
 ]
 
 [tool.setuptools]
@@ -42,6 +45,9 @@ packages = ["laya"]
 serve = [
     "fastapi>=0.110.0",
     "uvicorn>=0.27.0",
+]
+train = [
+    "tensorboard>=2.14.0",
 ]
 
 [project.scripts]
