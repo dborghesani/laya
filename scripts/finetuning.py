@@ -1,0 +1,415 @@
+"""Fine-tune and evaluate Laya on a local typed-decisions dataset.
+
+Example:
+	python research/scripts/finetune.py \
+		--dataset dataset/laya_automotive_typed_decisions_50k \
+		--output models/laya-automotive
+
+The dataset must expose ``state``, ``questions`` and ``gold`` columns.  A
+DatasetDict with ``train``/``test`` splits, a saved Hugging Face dataset, or a
+directory containing train/test Parquet files is supported.
+"""
+import argparse
+import glob
+import json
+import os
+import random
+import sys
+import time
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Sized, Tuple, TypedDict, Union, cast
+
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("USE_TORCH", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+import numpy as np
+import torch
+from safetensors.torch import load_file, save_file
+from transformers import AutoTokenizer
+
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, REPO)
+
+import laya
+from laya.agent import _fix_tokenizer_config
+from laya.common import QTYPES, build_model, build_sequence, proper_reward, render_options
+from datasets import Dataset, load_dataset, load_from_disk
+
+
+JSONValue = Union[None, bool, int, float, str, List["JSONValue"], Dict[str, "JSONValue"]]
+State = Union[str, Dict[str, JSONValue], List[JSONValue]]
+
+
+class Question(TypedDict, total=False):
+	type: str
+	instructions: Union[str, JSONValue]
+	criteria: Union[Dict[str, JSONValue], List[JSONValue]]
+
+
+class InternalQuestion(TypedDict):
+	t: str
+	ins: str
+	crit: Any
+
+
+class TrainingItem(TypedDict):
+	ids: List[int]
+	markers: List[int]
+	qtype: int
+	target: List[float]
+	label: int
+
+
+class Batch(TypedDict):
+	input_ids: torch.Tensor
+	attention_mask: torch.Tensor
+	marker_pos: torch.Tensor
+	marker_mask: torch.Tensor
+	target: torch.Tensor
+	qtype: torch.Tensor
+
+
+CalibrationRecord = Tuple[int, Sequence[float], Sequence[float]]
+
+
+def parse_json(value: Union[str, JSONValue]) -> Any:
+	return json.loads(value) if isinstance(value, str) else value
+
+
+def load_split(path: str, split: str) -> Dataset:
+	if not os.path.exists(path):
+		raise FileNotFoundError("Dataset path does not exist: %s" % path)
+	jsonl = os.path.join(path, "%s.jsonl" % split)
+	if os.path.exists(jsonl):
+		return load_dataset("json", data_files={split: jsonl}, split=split)
+	try:
+		loaded = load_from_disk(path)
+		if hasattr(loaded, "keys"):
+			return loaded[split]
+		return loaded
+	except (FileNotFoundError, ValueError, KeyError):
+		pass
+
+	files = sorted(glob.glob(os.path.join(path, "**", "*.parquet"), recursive=True))
+	if files:
+		split_files = [f for f in files if split in os.path.basename(f).lower()]
+		loaded = load_dataset("parquet", data_files={split: split_files or files}, split=split)
+		if split_files or "split" not in loaded.column_names:
+			return loaded
+		return loaded.filter(lambda row: row["split"] == split)
+	return load_dataset(path, split=split)
+
+
+def internal_question(question: Mapping[str, Any]) -> InternalQuestion:
+	qtype = question["type"]
+	criteria = question.get("criteria")
+	if qtype == "choice" and isinstance(criteria, list):
+		criteria = {key: None for key in criteria}
+	instructions = question["instructions"]
+	if not isinstance(instructions, str):
+		instructions = json.dumps(instructions, ensure_ascii=False)
+	return {"t": qtype, "ins": instructions, "crit": criteria}
+
+
+def training_item(
+	tokenizer: Any,
+	cfg: Mapping[str, Any],
+	state: State,
+	question: Mapping[str, Any],
+	gold: Mapping[str, Any],
+) -> Optional[TrainingItem]:
+	q = internal_question(question)
+	probabilities = gold.get("probabilities", {})
+	if q["t"] == "choice":
+		target = [float(probabilities.get(key, 0.0)) for key in q["crit"]]
+	elif q["t"] == "noul":
+		target = [float(probabilities.get("false", 0.5)), float(probabilities.get("true", 0.5))]
+	else:
+		target = [float(probabilities.get(str(i), 0.0)) for i in range(len(q["crit"]))]
+	total = sum(target)
+	target = [v / total for v in target] if total > 0 else [1.0 / len(target)] * len(target)
+	sequence, markers = build_sequence(tokenizer, state, cast(Dict[str, Any], q),
+										 cfg["max_len"], cfg["head_max_len"])
+	if len(markers) != len(render_options(cast(Dict[str, Any], q))):
+		return None
+	return {"ids": sequence, "markers": markers, "qtype": QTYPES[q["t"]],
+			"target": target, "label": int(np.argmax(target))}
+
+
+def preprocess(dataset: Iterable[Mapping[str, Any]], tokenizer: Any,
+			   cfg: Mapping[str, Any]) -> List[TrainingItem]:
+	items: List[TrainingItem] = []
+	for row in dataset:
+		state = parse_json(row["state"])
+		questions = parse_json(row["questions"])
+		gold = parse_json(row["gold"])
+		for qid, question in questions.items():
+			if qid in gold:
+				item = training_item(tokenizer, cfg, state, question, gold[qid])
+				if item is not None:
+					items.append(item)
+	return items
+
+
+def collate(batch: Sequence[TrainingItem], pad_id: int) -> Batch:
+	n, length = len(batch), max(len(item["ids"]) for item in batch)
+	kmax = max(len(item["markers"]) for item in batch)
+	ids = torch.full((n, length), pad_id, dtype=torch.long)
+	attention = torch.zeros((n, length), dtype=torch.long)
+	markers = torch.zeros((n, kmax), dtype=torch.long)
+	mask = torch.zeros((n, kmax), dtype=torch.bool)
+	target = torch.zeros((n, kmax), dtype=torch.float32)
+	for i, item in enumerate(batch):
+		ids[i, :len(item["ids"])] = torch.tensor(item["ids"])
+		attention[i, :len(item["ids"])] = 1
+		k = len(item["markers"])
+		markers[i, :k] = torch.tensor(item["markers"])
+		mask[i, :k] = True
+		target[i, :len(item["target"])] = torch.tensor(item["target"])
+	return {"input_ids": ids, "attention_mask": attention, "marker_pos": markers,
+			"marker_mask": mask, "target": target,
+			"qtype": torch.tensor([item["qtype"] for item in batch])}
+
+
+def fit_temperature(predictions: Sequence[CalibrationRecord]) -> List[float]:
+	fitted = [1.2, 1.2, 1.2]
+	for qtype in range(3):
+		selected = [(z, target) for qt, z, target in predictions if qt == qtype]
+		if len(selected) < 10:
+			continue
+		width = max(len(z) for z, _ in selected)
+		logits = torch.full((len(selected), width), -1e4)
+		targets = torch.zeros((len(selected), width))
+		for i, (z, target) in enumerate(selected):
+			logits[i, :len(z)] = torch.tensor(z)
+			targets[i, :len(target)] = torch.tensor(target)
+		log_temp = torch.zeros(1, requires_grad=True)
+		optimizer = torch.optim.LBFGS([log_temp], lr=0.1, max_iter=100)
+
+		def closure():
+			optimizer.zero_grad()
+			loss = -(targets * torch.log_softmax(logits / log_temp.exp(), -1)).sum(-1).mean()
+			loss.backward()
+			return loss
+
+		optimizer.step(closure)
+		fitted[qtype] = float(torch.clamp(log_temp.exp(), 0.1, 10.0).item())
+	return fitted
+
+
+def train(
+	items: List[TrainingItem],
+	model_dir: str,
+	output_dir: str,
+	args: argparse.Namespace,
+) -> List[float]:
+	with open(os.path.join(model_dir, "rl_agent_config.json")) as handle:
+		cfg = json.load(handle)
+	cfg.update({"gradient_checkpointing": True, "max_tokens_per_batch": args.max_tokens,
+				"max_len": args.max_len, "head_max_len": args.head_max_len})
+	tokenizer = AutoTokenizer.from_pretrained(os.path.join(model_dir, "tokenizer"))
+	model = build_model(cfg, encoder_dir=os.path.join(model_dir, "encoder"))
+	model.load_state_dict(load_file(os.path.join(model_dir, "model.safetensors")), strict=True)
+	device = torch.device(args.device)
+	if device.type == "cuda":
+		device = torch.device("cuda", 0 if device.index is None else device.index)
+		torch.cuda.set_device(device)
+		model.encoder.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+	model.head_checkpointing = True
+	model.to(device).train()
+	encoder_params = [p for name, p in model.named_parameters() if "encoder." in name]
+	head_params = [p for name, p in model.named_parameters() if "encoder." not in name]
+	optimizer = torch.optim.AdamW([
+		{"params": encoder_params, "lr": args.lr_encoder},
+		{"params": head_params, "lr": args.lr_head},
+	], weight_decay=0.01)
+	updates = max(1, (len(items) // args.batch_size) * args.epochs // args.grad_accum)
+	scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, updates, eta_min=1e-6)
+	scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+	rng = random.Random(args.seed)
+	for epoch in range(args.epochs):
+		rng.shuffle(items)
+		sigma = args.sigma_start + (args.sigma_end - args.sigma_start) * epoch / max(1, args.epochs - 1)
+		optimizer.zero_grad(set_to_none=True)
+		for step in range(0, len(items), args.batch_size):
+			batch_items = items[step:step + args.batch_size]
+			batch = collate(batch_items, tokenizer.pad_token_id)
+			autocast = torch.autocast("cuda", dtype=torch.float16, enabled=device.type == "cuda")
+			with autocast:
+				logits, act = model(batch["input_ids"].to(device), batch["attention_mask"].to(device),
+									 batch["marker_pos"].to(device), batch["marker_mask"].to(device),
+									 batch["qtype"].to(device))
+			logits = logits.float()
+			mask = batch["marker_mask"].to(device)
+			target = batch["target"].to(device)
+			k = mask.sum(-1, keepdim=True).float()
+			noise = torch.randn((args.group_size,) + logits.shape, device=device) * sigma * mask
+			noise = (noise - noise.sum(-1, keepdim=True) / k) * mask
+			sampled = logits.detach().unsqueeze(0) + noise
+			probs = torch.softmax(sampled.masked_fill(~mask, -1e4), -1)
+			with torch.no_grad():
+				reward = proper_reward(probs, target.unsqueeze(0), batch["qtype"].to(device), mask,
+									   w_sph=0.75, w_rps=1.0)
+				advantage = reward - reward.mean(0, keepdim=True)
+				advantage = advantage / (advantage.std() + 1e-6)
+			log_prob = -(((sampled - logits.unsqueeze(0)) ** 2) * mask).sum(-1) / (2 * sigma ** 2)
+			loss_rl = -(advantage * log_prob).mean()
+			loss_ce = -(target * torch.log_softmax(logits.masked_fill(~mask, -1e4), -1)).sum(-1).mean()
+			loss = (loss_rl + loss_ce + 0.0 * act.sum()) / args.grad_accum
+			scaler.scale(loss).backward()
+			if ((step // args.batch_size) + 1) % args.grad_accum == 0 or step + args.batch_size >= len(items):
+				scaler.unscale_(optimizer)
+				torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+				old_scale = scaler.get_scale()
+				scaler.step(optimizer)
+				scaler.update()
+				if scaler.get_scale() >= old_scale:
+					scheduler.step()
+				optimizer.zero_grad(set_to_none=True)
+			print("step %d/%d complete" % (step + 1, len(items)), flush=True)
+		print("epoch %d/%d complete" % (epoch + 1, args.epochs), flush=True)
+
+	model.eval()
+	calibration = []
+	with torch.no_grad():
+		for start in range(0, min(len(items), args.calibration_items), args.eval_batch_size):
+			subset = items[start:start + args.eval_batch_size]
+			batch = collate(subset, tokenizer.pad_token_id)
+			logits, _ = model(batch["input_ids"].to(device), batch["attention_mask"].to(device),
+							  batch["marker_pos"].to(device), batch["marker_mask"].to(device),
+							  batch["qtype"].to(device))
+			for row, item in zip(logits.float().cpu().numpy(), subset):
+				calibration.append((item["qtype"], row[:len(item["markers"])], item["target"]))
+	temperatures = fit_temperature(calibration)
+	os.makedirs(output_dir, exist_ok=True)
+	save_file({key: value.half().contiguous().cpu() for key, value in model.state_dict().items()},
+			  os.path.join(output_dir, "model.safetensors"))
+	model.encoder.config.save_pretrained(os.path.join(output_dir, "encoder"))
+	tokenizer.save_pretrained(os.path.join(output_dir, "tokenizer"))
+	cfg.update({"fine_tuned": True, "model_name": "laya-automotive-typed-decisions",
+				"temperature": temperatures})
+	with open(os.path.join(output_dir, "rl_agent_config.json"), "w") as handle:
+		json.dump(cfg, handle, indent=2)
+	return temperatures
+
+
+def evaluate(
+	dataset: Iterable[Mapping[str, Any]],
+	output_dir: str,
+	report_path: str,
+	device: str,
+) -> Dict[str, Any]:
+	agent = laya.Agent(output_dir, device=device)
+	predictions, latencies = [], []
+	for row in dataset:
+		state, questions = parse_json(row["state"]), parse_json(row["questions"])
+		gold = parse_json(row["gold"])
+		start = time.perf_counter()
+		answers = agent.predict(state, questions)["answers"]
+		latencies.append((time.perf_counter() - start) * 1000)
+		predictions.append({"workflow": row.get("workflow", "unknown"), "pred": answers,
+							"gold": gold, "questions": questions})
+	accuracy, soft, brier, kl, tv, conf, correct = [], [], [], [], [], [], []
+	score_mae, within_one = [], []
+	per_workflow: Dict[str, List[float]] = {}
+	for item in predictions:
+		wf_correct = per_workflow.setdefault(item["workflow"], [])
+		for qid, question in item["questions"].items():
+			pred, gold = item["pred"][qid], item["gold"][qid]
+			qtype = question["type"]
+			if qtype == "choice":
+				criteria = question["criteria"]
+				keys = list(criteria.keys()) if isinstance(criteria, dict) else list(criteria)
+				pp = np.array([pred["probabilities"].get(k, 1e-6) for k in keys], float)
+				gp = np.array([gold["probabilities"].get(k, 1e-6) for k in keys], float)
+			elif qtype == "noul":
+				p = float(pred["noul"]); g = float(gold.get("noul", gold.get("probabilities", {}).get("true", 0.5)))
+				pp, gp = np.array([1 - p, p]), np.array([1 - g, g])
+			else:
+				levels = len(question.get("criteria", []))
+				pp = np.array([pred["probabilities"].get(str(i), 0.0) for i in range(levels)], float)
+				gp = np.array([gold["probabilities"].get(str(i), 0.0) for i in range(levels)], float)
+				expected = float((np.arange(len(pp)) * pp).sum()) if pp.sum() else float(pred["score"])
+				actual = float(gold.get("score", gold.get("label", 0)))
+				score_mae.append(abs(expected - actual)); within_one.append(float(abs(expected - actual) <= 1))
+			pp /= max(pp.sum(), 1e-12); gp /= max(gp.sum(), 1e-12)
+			predicted_label = int(np.argmax(pp))
+			if qtype == "choice":
+				gold_label = keys.index(str(gold["label"]))
+			elif qtype == "noul":
+				gold_label = int(str(gold["label"]).lower() == "true")
+			else:
+				gold_label = int(gold["label"])
+			hit = float(predicted_label == gold_label)
+			accuracy.append(hit); wf_correct.append(hit); conf.append(float(pp.max())); correct.append(hit)
+			soft.append(float((pp * gp).sum())); brier.append(float(((pp - gp) ** 2).sum()))
+			kl.append(float((gp * np.log(np.clip(gp / pp, 1e-12, 1e4))).sum()))
+			tv.append(float(0.5 * np.abs(pp - gp).sum()))
+	metrics = {"accuracy": float(np.mean(accuracy)), "soft_accuracy": float(np.mean(soft)),
+			   "brier": float(np.mean(brier)), "ece": laya.ece_score(np.array(conf), np.array(correct)),
+			   "score_mae": float(np.mean(score_mae)) if score_mae else 0.0,
+			   "within_1_level": float(np.mean(within_one)) if within_one else 0.0,
+			   "latency_p50_ms": float(np.percentile(latencies, 50)),
+			   "latency_p95_ms": float(np.percentile(latencies, 95)),
+			   "kl_divergence": float(np.mean(kl)), "total_variation": float(np.mean(tv))}
+	report = {"benchmark": "laya_automotive_typed_decisions_50k", "n_cases": len(cast(Sized, dataset)),
+			  "n_decisions": len(accuracy), "metrics": metrics,
+			  "comparison": {"TypeSafe Jev 1.13.0": {
+				  "accuracy": 0.727, "soft_accuracy": 0.580, "brier": 0.148,
+				  "ece": 0.144, "score_mae": 0.391, "latency_p50_ms": 710,
+				  "source": "published reference from the original typed-decisions benchmark"},
+							 "Teacher Self-Agreement": {"accuracy": 0.735},
+							 "Laya (fine-tuned)": metrics},
+			  "per_workflow": {wf: {"n_decisions": len(values), "accuracy": float(np.mean(values))}
+							   for wf, values in per_workflow.items()}}
+	os.makedirs(os.path.dirname(os.path.abspath(report_path)), exist_ok=True)
+	with open(report_path, "w") as handle:
+		json.dump(report, handle, indent=2)
+	print(json.dumps(report, indent=2))
+	return report
+
+
+def main() -> None:
+	parser = argparse.ArgumentParser()
+	parser.add_argument("--dataset", default="dataset/laya_automotive_typed_decisions_50k")
+	parser.add_argument("--model", default="convaiinnovations/laya")
+	parser.add_argument("--output", default="laya_automotive_finetuned")
+	parser.add_argument("--report", default=None)
+	parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+	parser.add_argument("--epochs", type=int, default=4)
+	parser.add_argument("--batch-size", type=int, default=8)
+	parser.add_argument("--grad-accum", type=int, default=4)
+	parser.add_argument("--group-size", type=int, default=4)
+	parser.add_argument("--eval-batch-size", type=int, default=16)
+	parser.add_argument("--calibration-items", type=int, default=400)
+	parser.add_argument("--max-len", type=int, default=1024)
+	parser.add_argument("--head-max-len", type=int, default=256)
+	parser.add_argument("--max-tokens", type=int, default=4096)
+	parser.add_argument("--lr-encoder", type=float, default=2.5e-5)
+	parser.add_argument("--lr-head", type=float, default=1e-4)
+	parser.add_argument("--sigma-start", type=float, default=0.4)
+	parser.add_argument("--sigma-end", type=float, default=0.1)
+	parser.add_argument("--seed", type=int, default=42)
+	args = parser.parse_args()
+	random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
+	model_dir = args.model
+	if not os.path.exists(model_dir):
+		from huggingface_hub import snapshot_download
+		model_dir = snapshot_download(model_dir)
+	_fix_tokenizer_config(model_dir)
+	with open(os.path.join(model_dir, "rl_agent_config.json")) as handle:
+		cfg = json.load(handle)
+	cfg.update({"max_len": args.max_len, "head_max_len": args.head_max_len})
+	tokenizer = AutoTokenizer.from_pretrained(os.path.join(model_dir, "tokenizer"))
+	train_data = load_split(args.dataset, "train")
+	test_data = load_split(args.dataset, "test")
+	items = preprocess(train_data, tokenizer, cfg)
+	print("preprocessed %d training decisions from %d cases" % (len(items), len(train_data)), flush=True)
+	temperatures = train(items, model_dir, args.output, args)
+	print("calibration temperatures: %s" % [round(value, 3) for value in temperatures], flush=True)
+	report = args.report or os.path.join(args.output, "benchmark_report.json")
+	evaluate(test_data, args.output, report, args.device)
+
+
+if __name__ == "__main__":
+	main()
