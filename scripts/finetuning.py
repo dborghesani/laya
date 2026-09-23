@@ -312,6 +312,7 @@ def train(
 	checkpoints_dir = os.path.join(output_dir, "checkpoints")
 
 	def save_checkpoint(name: str, validation_loss: float) -> str:
+		logger.info("Saving checkpoint '%s' with validation loss %f", name, validation_loss)
 		checkpoint_dir = os.path.join(checkpoints_dir, name)
 		os.makedirs(checkpoint_dir, exist_ok=True)
 		save_file({key: value.half().contiguous().cpu() for key, value in model.state_dict().items()},
@@ -323,8 +324,12 @@ def train(
 	def validation_cross_entropy() -> float:
 		model.eval()
 		loss_sum, item_count = 0.0, 0
+		logger.info("Starting validation...")
 		with torch.no_grad():
 			for start in range(0, len(validation_items), args.eval_batch_size):
+				# log every args.log_every batches
+				if start // args.eval_batch_size % args.log_every == 0:
+					logger.info("Validating batch %d/%d", start // args.eval_batch_size + 1, (len(validation_items) + args.eval_batch_size - 1) // args.eval_batch_size)
 				batch_items = validation_items[start:start + args.eval_batch_size]
 				batch = collate(batch_items, tokenizer.pad_token_id)
 				logits, _ = model(batch["input_ids"].to(device), batch["attention_mask"].to(device),
@@ -335,6 +340,10 @@ def train(
 				loss = -(target * torch.log_softmax(logits.float().masked_fill(~mask, -1e4), -1)).sum(-1)
 				loss_sum += loss.sum().item()
 				item_count += len(batch_items)
+				# early exit
+				#if start // args.eval_batch_size + 1 >= 50:
+			    #	break
+		logger.info("Validation loss: %f", loss_sum / item_count)
 		model.train()
 		return loss_sum / item_count
 
@@ -392,13 +401,13 @@ def train(
 				elapsed = time.perf_counter() - training_start
 				eta = elapsed / global_step * (total_steps - global_step)
 				logger.info(
-					"train",
+					"epoch: {epoch}, step: {step}, loss: {loss}, loss_rl: {loss_rl}, loss_ce: {loss_ce}, eta: {eta}".format(
 					epoch=f"{epoch + 1}/{args.epochs}",
 					step=f"{step // args.batch_size + 1}/{batches_per_epoch}",
 					loss=round(metrics["loss_total"], 5),
 					loss_rl=round(metrics["loss_rl"], 5),
 					loss_ce=round(metrics["loss_cross_entropy"], 5),
-					eta=format_duration(eta),
+					eta=format_duration(eta))
 				)
 			if ((step // args.batch_size) + 1) % args.grad_accum == 0 or step + args.batch_size >= len(items):
 				scaler.unscale_(optimizer)
@@ -409,6 +418,9 @@ def train(
 				if scaler.get_scale() >= old_scale:
 					scheduler.step()
 				optimizer.zero_grad(set_to_none=True)
+			# early exit
+			#if step >= 200:
+			#	break
 		logger.info("epoch_complete", epoch=epoch + 1, epochs=args.epochs,
 					items=len(items), duration_seconds=time.perf_counter() - epoch_start)
 		validation_loss = validation_cross_entropy()
