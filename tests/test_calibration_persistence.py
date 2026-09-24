@@ -2,8 +2,10 @@
 
 Run: python tests/test_calibration_persistence.py
 """
+import argparse
 import ast
 import copy
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -46,6 +48,15 @@ def export_notebook_config(cfg, fitted_temps, output_dir):
         "os": os, "json": json,
     })
     return json.loads((output_dir / "rl_agent_config.json").read_text())
+
+
+def load_finetuning_module():
+    module_path = Path(__file__).resolve().parents[1] / "scripts" / "finetuning.py"
+    spec = importlib.util.spec_from_file_location("finetuning_script", module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+    return module
 
 
 class CalibrationPersistenceTests(unittest.TestCase):
@@ -163,6 +174,44 @@ class CalibrationPersistenceTests(unittest.TestCase):
         self.cfg.pop("temperature")
         self.write_config()
         self.assert_inference_temperatures({(t, 2): 1.0 for t in QTYPES})
+
+    def test_apply_dataset_limit_scales_each_split_by_fraction(self):
+        module = load_finetuning_module()
+        dataset = list(range(100))
+
+        fake = type("D", (), {"select": lambda self, idx: [dataset[i] for i in idx], "__len__": lambda self: len(dataset)})()
+        subset = module.apply_dataset_limit(fake, 0.25)
+        self.assertEqual(len(subset), 25)
+        self.assertEqual(subset[:3], [0, 1, 2])
+
+        full = module.apply_dataset_limit(fake, None)
+        self.assertEqual(len(full), 100)
+
+    def test_export_model_bundle_writes_full_checkpoint(self):
+        module = load_finetuning_module()
+        output_dir = self.checkpoint / "intermediate_export"
+        output_dir.mkdir(exist_ok=True)
+        config = BertConfig(vocab_size=6, hidden_size=16, num_hidden_layers=1,
+                            num_attention_heads=1, intermediate_size=32)
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(WordLevel(
+                {"[PAD]": 0, "[UNK]": 1, "[CLS]": 2, "[SEP]": 3, "[MASK]": 4, "hello": 5},
+                unk_token="[UNK]")),
+            pad_token="[PAD]", unk_token="[UNK]", cls_token="[CLS]",
+            sep_token="[SEP]", mask_token="[MASK]",
+        )
+        model = DecisionModel(BertModel(config), head_layers=0)
+        cfg = {"encoder": "unused/offline", "head_layers": 0, "max_len": 128, "head_max_len": 96,
+               "temperature": [1.0, 1.0, 1.0], "fine_tuned": True}
+
+        module.export_model_bundle(output_dir, model, tokenizer, cfg)
+
+        self.assertTrue((output_dir / "model.safetensors").exists())
+        self.assertTrue((output_dir / "encoder").is_dir())
+        self.assertTrue((output_dir / "tokenizer").is_dir())
+        self.assertTrue((output_dir / "rl_agent_config.json").exists())
+        written_cfg = json.loads((output_dir / "rl_agent_config.json").read_text())
+        self.assertEqual(written_cfg["temperature"], [1.0, 1.0, 1.0])
 
 
 if __name__ == "__main__":

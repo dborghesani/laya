@@ -49,7 +49,7 @@ from pynvml import (
 from safetensors.torch import load_file, save_file
 from transformers import AutoTokenizer
 
-REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
 from datasets import Dataset, load_dataset, load_from_disk
@@ -345,6 +345,27 @@ def fit_temperature(predictions: Sequence[CalibrationRecord]) -> list[float]:
 	return fitted
 
 
+def apply_dataset_limit(dataset: Dataset, limit: float | None) -> Dataset:
+	if limit is None:
+		return dataset
+	if not 0.0 < limit <= 1.0:
+		raise ValueError(f"--limit must be a float in (0, 1], got {limit!r}")
+	count = max(1, int(len(dataset) * limit))
+	return dataset.select(range(min(count, len(dataset))))
+
+
+def export_model_bundle(output_dir: str, model: torch.nn.Module, tokenizer: Any, cfg: Mapping[str, Any]) -> None:
+	os.makedirs(output_dir, exist_ok=True)
+	save_file({key: value.half().contiguous().cpu() for key, value in model.state_dict().items()},
+			  os.path.join(output_dir, "model.safetensors"))
+	encoder = getattr(model, "encoder", None)
+	if encoder is not None and hasattr(encoder, "config"):
+		encoder.config.save_pretrained(os.path.join(output_dir, "encoder"))
+	tokenizer.save_pretrained(os.path.join(output_dir, "tokenizer"))
+	with open(os.path.join(output_dir, "rl_agent_config.json"), "w") as handle:
+		json.dump(dict(cfg), handle, indent=2)
+
+
 def train(
 	items: list[TrainingItem],
 	validation_items: list[TrainingItem],
@@ -385,9 +406,7 @@ def train(
 	def save_checkpoint(name: str, validation_loss: float | None) -> str:
 		logger.info("Saving checkpoint '%s' with validation loss %s", name, validation_loss)
 		checkpoint_dir = os.path.join(checkpoints_dir, name)
-		os.makedirs(checkpoint_dir, exist_ok=True)
-		save_file({key: value.half().contiguous().cpu() for key, value in model.state_dict().items()},
-				  os.path.join(checkpoint_dir, "model.safetensors"))
+		export_model_bundle(checkpoint_dir, model, tokenizer, cfg)
 		with open(os.path.join(checkpoint_dir, "metadata.json"), "w") as handle:
 			json.dump({"epoch": epoch + 1, "validation_cross_entropy": validation_loss}, handle, indent=2)
 		return checkpoint_dir
@@ -526,15 +545,9 @@ def train(
 			for row, item in zip(logits.float().cpu().numpy(), subset):
 				calibration.append((item["qtype"], row[:len(item["markers"])], item["target"]))
 	temperatures = fit_temperature(calibration)
-	os.makedirs(output_dir, exist_ok=True)
-	save_file({key: value.half().contiguous().cpu() for key, value in model.state_dict().items()},
-			  os.path.join(output_dir, "model.safetensors"))
-	model.encoder.config.save_pretrained(os.path.join(output_dir, "encoder"))
-	tokenizer.save_pretrained(os.path.join(output_dir, "tokenizer"))
 	cfg.update({"fine_tuned": True, "model_name": "laya-automotive-typed-decisions",
 				"temperature": temperatures})
-	with open(os.path.join(output_dir, "rl_agent_config.json"), "w") as handle:
-		json.dump(cfg, handle, indent=2)
+	export_model_bundle(output_dir, model, tokenizer, cfg)
 	logger.info(f"finetuning complete, temperatures: {temperatures}")
 	return temperatures
 
@@ -544,10 +557,21 @@ def evaluate(
 	output_dir: str,
 	report_path: str,
 	device: torch.device,
+	limit: float | None = None,
 ) -> dict[str, Any]:
+	if limit is not None:
+		dataset = apply_dataset_limit(dataset, limit)
+		logger.info("evaluation limit applied: %.3f -> %d rows", limit, len(cast(Sized, dataset)))
+	if not hasattr(dataset, "__len__"):
+		dataset = list(dataset)
+	total_cases = len(cast(Sized, dataset))
+	logger.info("loading model from %s...", output_dir)
 	agent = laya.Agent(output_dir, device=device)
+	logger.info("starting evaluation on %d cases", total_cases)
 	predictions, latencies = [], []
-	for row in dataset:
+	for i, row in enumerate(dataset, start=1):
+		if total_cases > 1 and (i == 1 or i == total_cases or i % max(1, total_cases // 10) == 0):
+			logger.info("evaluation progress: %d/%d cases (%.1f%%)", i, total_cases, (i / total_cases) * 100.0)
 		state, questions = parse_json(row["state"]), parse_json(row["questions"])
 		gold = parse_json(row["gold"])
 		start = time.perf_counter()
@@ -558,6 +582,7 @@ def evaluate(
 	accuracy, soft, brier, kl, tv, conf, correct = [], [], [], [], [], [], []
 	score_mae, within_one = [], []
 	per_workflow: dict[str, list[float]] = {}
+	logger.info("aggregating metrics over %d predictions", len(predictions))
 	for item in predictions:
 		wf_correct = per_workflow.setdefault(item["workflow"], [])
 		for qid, question in item["questions"].items():
@@ -618,8 +643,8 @@ def evaluate(
 def main() -> None:
 	parser = argparse.ArgumentParser()
 	parser.add_argument("--dataset", default="dataset/laya_automotive_typed_decisions_50k")
-	parser.add_argument("--limit", type=int, default=None,
-						help="use at most N cases from each split (useful for fast local debugging)")
+	parser.add_argument("--limit", type=float, default=None,
+						help="fraction of each split to keep for quick smoke tests (e.g. 0.1 = 10% of train/test)")
 	parser.add_argument("--model", default="convaiinnovations/laya")
 	parser.add_argument("--output", default="output")
 	parser.add_argument("--preprocessing-cache-dir", default=None,
@@ -659,8 +684,8 @@ def main() -> None:
 						help="skip training and only evaluate an already fine-tuned model directory "
 							 "(e.g. an output run directory or its checkpoints/last or checkpoints/best subfolder)")
 	args = parser.parse_args()
-	if args.limit is not None and args.limit < 1:
-		parser.error("--limit must be at least 1")
+	if args.limit is not None and not (0.0 < args.limit <= 1.0):
+		parser.error("--limit must be a float in (0, 1] (for example 0.1 means 10% of the split)")
 	if args.log_every < 1:
 		parser.error("--log-every must be at least 1")
 	random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
@@ -672,11 +697,11 @@ def main() -> None:
 		if not os.path.isdir(args.eval_model_dir):
 			raise FileNotFoundError(f"Model directory does not exist: {args.eval_model_dir}")
 		logger.info("loading dataset for evaluation...")
-		test_data = load_split(args.dataset, "test", args.limit)
+		test_data = apply_dataset_limit(load_split(args.dataset, "test"), args.limit)
 		logger.info(f"loaded {len(test_data)} test cases")
 		report = args.report or os.path.join(args.eval_model_dir, "benchmark_report.json")
 		logger.info("starting evaluation...")
-		evaluate(test_data, args.eval_model_dir, report, device)
+		evaluate(test_data, args.eval_model_dir, report, device, limit=args.limit)
 		return
 
 	logger.info(f"preparing model {args.model}...")
@@ -688,8 +713,8 @@ def main() -> None:
 	logger.info("loading tokenizer...")
 	tokenizer = AutoTokenizer.from_pretrained(os.path.join(model_dir, "tokenizer"))
 	logger.info("loading dataset and preprocessing...")
-	train_data = load_split(args.dataset, "train", args.limit)
-	test_data = load_split(args.dataset, "test", args.limit)
+	train_data = apply_dataset_limit(load_split(args.dataset, "train"), args.limit)
+	test_data = apply_dataset_limit(load_split(args.dataset, "test"), args.limit)
 	logger.info(f"loaded {len(train_data)} training cases and {len(test_data)} test cases")
 	cache_dir = None if args.no_preprocessing_cache else (
 		args.preprocessing_cache_dir or os.path.join(args.dataset, "laya-preprocessing-cache"))
@@ -710,7 +735,7 @@ def main() -> None:
 	logger.info("calibration temperatures: %s" % [round(value, 3) for value in temperatures])
 	report = args.report or os.path.join(output_dir, "benchmark_report.json")
 	logger.info("starting evaluation...")
-	evaluate(test_data, output_dir, report, device)
+	evaluate(test_data, output_dir, report, device, limit=args.limit)
 
 
 if __name__ == "__main__":

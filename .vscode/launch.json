@@ -11,7 +11,29 @@
             "program": "scripts/finetuning.py",
             "console": "integratedTerminal",
             "args": [
-                "--no-save-best"
+                "--no-save-best",
+            ]
+        },
+        {
+            "name": "finetuning_debug",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/finetuning.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--no-save-best",
+                "--limit", "0.02"
+            ]
+        },
+        {
+            "name": "eval",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/finetuning.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--eval-model-dir", "output/run-20260924T123710Z-622295/checkpoints/last",
+                "--limit", "0.1"
             ]
         },
         {
