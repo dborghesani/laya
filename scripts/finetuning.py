@@ -11,6 +11,8 @@ directory containing train/test Parquet files is supported.
 """
 import argparse
 import glob
+import hashlib
+import importlib.util
 import json
 import os
 import random
@@ -26,7 +28,6 @@ from typing import (
 
 import structlog
 from huggingface_hub import snapshot_download
-from torch.utils.tensorboard import SummaryWriter
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("USE_TORCH", "1")
@@ -99,6 +100,24 @@ class Batch(TypedDict):
 
 
 CalibrationRecord = tuple[int, Sequence[float], Sequence[float]]
+
+
+def get_summary_writer(output_dir: str) -> Any | None:
+	if importlib.util.find_spec("tensorboard") is None:
+		logger.warning(
+			"TensorBoard is not installed; skipping TensorBoard logging. "
+			"Install it with `uv sync --extra train` or `pip install tensorboard torch-tb-profiler`."
+		)
+		return None
+	try:
+		from torch.utils.tensorboard import SummaryWriter
+	except ImportError:
+		logger.warning(
+			"TensorBoard is unavailable in this environment; skipping TensorBoard logging. "
+			"Install it with `uv sync --extra train` or `pip install tensorboard torch-tb-profiler`."
+		)
+		return None
+	return SummaryWriter(os.path.join(output_dir, "tensorboard"))
 
 
 def gpu_metrics(device: torch.device) -> dict[str, float]:
@@ -237,6 +256,56 @@ def preprocess(dataset: Iterable[Mapping[str, Any]], tokenizer: Any,
 	return items
 
 
+def preprocessing_cache_key(
+	dataset_path: str,
+	split: str,
+	limit: int | None,
+	tokenizer: Any,
+	cfg: Mapping[str, Any],
+) -> str:
+	metadata = {
+		"dataset_path": os.path.abspath(dataset_path),
+		"split": split,
+		"limit": limit,
+		"max_len": cfg["max_len"],
+		"head_max_len": cfg["head_max_len"],
+		"tokenizer": tokenizer.name_or_path,
+	}
+	for path in sorted(glob.glob(os.path.join(dataset_path, "**", f"{split}.*"), recursive=True)):
+		try:
+			stat = os.stat(path)
+			metadata[path] = (stat.st_mtime_ns, stat.st_size)
+		except OSError:
+			continue
+	return hashlib.sha256(json.dumps(metadata, sort_keys=True).encode()).hexdigest()
+
+
+def load_or_preprocess(
+	dataset: Iterable[Mapping[str, Any]],
+	dataset_path: str,
+	split: str,
+	limit: int | None,
+	tokenizer: Any,
+	cfg: Mapping[str, Any],
+	cache_dir: str | None,
+) -> list[TrainingItem]:
+	if cache_dir is None:
+		return preprocess(dataset, tokenizer, cfg)
+	cache_key = preprocessing_cache_key(dataset_path, split, limit, tokenizer, cfg)
+	cache_path = os.path.join(cache_dir, f"{split}-{cache_key}.json")
+	if os.path.exists(cache_path):
+		logger.info(f"loading preprocessed {split} data from {cache_path}")
+		with open(cache_path) as handle:
+			return cast(list[TrainingItem], json.load(handle))
+	logger.info(f"preprocessing {split} data...")
+	items = preprocess(dataset, tokenizer, cfg)
+	os.makedirs(cache_dir, exist_ok=True)
+	with open(cache_path, "w") as handle:
+		json.dump(items, handle)
+	logger.info(f"saved preprocessed {split} data to {cache_path}")
+	return items
+
+
 def collate(batch: Sequence[TrainingItem], pad_id: int) -> Batch:
 	n, length = len(batch), max(len(item["ids"]) for item in batch)
 	kmax = max(len(item["markers"]) for item in batch)
@@ -284,9 +353,7 @@ def train(
 	args: argparse.Namespace,
 	device: torch.device,
 ) -> list[float]:
-	writer = None
-	if args.tensorboard:
-		writer = SummaryWriter(os.path.join(output_dir, "tensorboard"))
+	writer = get_summary_writer(output_dir) if args.tensorboard else None
 	with open(os.path.join(model_dir, "rl_agent_config.json")) as handle:
 		cfg = json.load(handle)
 	cfg.update({"gradient_checkpointing": True, "max_tokens_per_batch": args.max_tokens,
@@ -555,6 +622,10 @@ def main() -> None:
 						help="use at most N cases from each split (useful for fast local debugging)")
 	parser.add_argument("--model", default="convaiinnovations/laya")
 	parser.add_argument("--output", default="output")
+	parser.add_argument("--preprocessing-cache-dir", default=None,
+						help="directory for reusable tokenized train/test data; defaults to DATASET/.laya-preprocessing-cache")
+	parser.add_argument("--no-preprocessing-cache", action="store_true",
+						help="always rebuild tokenized train/test data instead of reading or writing a cache")
 	parser.add_argument("--run-name", default=None,
 						help="name of the run directory under OUTPUT; defaults to a UTC timestamp and process ID")
 	parser.add_argument("--report", default=None)
@@ -620,9 +691,10 @@ def main() -> None:
 	train_data = load_split(args.dataset, "train", args.limit)
 	test_data = load_split(args.dataset, "test", args.limit)
 	logger.info(f"loaded {len(train_data)} training cases and {len(test_data)} test cases")
-	logger.info("preprocessing training data...")
-	items = preprocess(train_data, tokenizer, cfg)
-	validation_items = preprocess(test_data, tokenizer, cfg)
+	cache_dir = None if args.no_preprocessing_cache else (
+		args.preprocessing_cache_dir or os.path.join(args.dataset, "laya-preprocessing-cache"))
+	items = load_or_preprocess(train_data, args.dataset, "train", args.limit, tokenizer, cfg, cache_dir)
+	validation_items = load_or_preprocess(test_data, args.dataset, "test", args.limit, tokenizer, cfg, cache_dir)
 	logger.info(f"preprocessed {len(items)} training decisions from {len(train_data)} cases")
 	logger.info(f"preprocessed {len(validation_items)} validation decisions from {len(test_data)} cases")
 	if not validation_items:

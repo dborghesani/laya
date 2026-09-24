@@ -10,7 +10,9 @@
             "request": "launch",
             "program": "scripts/finetuning.py",
             "console": "integratedTerminal",
-            "args": []
+            "args": [
+                "--no-save-best"
+            ]
         },
         {
             "name": "Python Debugger: Current File",
