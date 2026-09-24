@@ -14,7 +14,6 @@ import glob
 import json
 import os
 import random
-import shutil
 import sys
 import time
 from collections.abc import Iterable, Mapping, Sequence, Sized
@@ -36,8 +35,8 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 import numpy as np
 import torch
 from pynvml import (
-	NVMLError,
 	NVML_TEMPERATURE_GPU,
+	NVMLError,
 	nvmlDeviceGetHandleByIndex,
 	nvmlDeviceGetHandleByUUID,
 	nvmlDeviceGetMemoryInfo,
@@ -313,11 +312,11 @@ def train(
 	batches_per_epoch = (len(items) + args.batch_size - 1) // args.batch_size
 	total_steps = args.epochs * batches_per_epoch
 	training_start = time.perf_counter()
-	best_checkpoints: list[tuple[float, str]] = []
+	best_validation_loss = float("inf")
 	checkpoints_dir = os.path.join(output_dir, "checkpoints")
 
-	def save_checkpoint(name: str, validation_loss: float) -> str:
-		logger.info("Saving checkpoint '%s' with validation loss %f", name, validation_loss)
+	def save_checkpoint(name: str, validation_loss: float | None) -> str:
+		logger.info("Saving checkpoint '%s' with validation loss %s", name, validation_loss)
 		checkpoint_dir = os.path.join(checkpoints_dir, name)
 		os.makedirs(checkpoint_dir, exist_ok=True)
 		save_file({key: value.half().contiguous().cpu() for key, value in model.state_dict().items()},
@@ -406,12 +405,13 @@ def train(
 				elapsed = time.perf_counter() - training_start
 				eta = elapsed / global_step * (total_steps - global_step)
 				logger.info(
-					"epoch: {epoch}, step: {step}, loss: {loss}, loss_rl: {loss_rl}, loss_ce: {loss_ce}, eta: {eta}".format(
+					"epoch: {epoch}, step: {step}, loss: {loss}, loss_rl: {loss_rl}, loss_ce: {loss_ce}, mean_reward: {mean_reward}, eta: {eta}".format(
 					epoch=f"{epoch + 1}/{args.epochs}",
 					step=f"{step // args.batch_size + 1}/{batches_per_epoch}",
 					loss=round(metrics["loss_total"], 5),
 					loss_rl=round(metrics["loss_rl"], 5),
-					loss_ce=round(metrics["loss_cross_entropy"], 5),
+					loss_ce=round(metrics["loss_cross_entropy"], 5), # should go down
+					mean_reward=round(metrics["mean_reward"], 5), # should go up
 					eta=format_duration(eta))
 				)
 			if ((step // args.batch_size) + 1) % args.grad_accum == 0 or step + args.batch_size >= len(items):
@@ -428,21 +428,24 @@ def train(
 			#	break
 		logger.info("epoch_complete", epoch=epoch + 1, epochs=args.epochs,
 					items=len(items), duration_seconds=time.perf_counter() - epoch_start)
-		validation_loss = validation_cross_entropy()
-		if writer is not None:
-			writer.add_scalar("validation/cross_entropy", validation_loss, epoch + 1)
-			writer.flush()
-		logger.info("validation_complete", epoch=epoch + 1, cross_entropy=round(validation_loss, 5))
-		if (epoch + 1) % args.checkpoint_every_epochs == 0:
-			save_checkpoint(f"epoch-{epoch + 1}", validation_loss)
-		best_checkpoint = save_checkpoint(f"best-epoch-{epoch + 1}", validation_loss)
-		best_checkpoints.append((validation_loss, best_checkpoint))
-		best_checkpoints.sort(key=lambda checkpoint: checkpoint[0])
-		while len(best_checkpoints) > args.save_best_limit:
-			_, checkpoint_dir = best_checkpoints.pop()
-			shutil.rmtree(checkpoint_dir)
+		validation_loss: float | None = None
+		if args.validate:
+			validation_loss = validation_cross_entropy()
+			if writer is not None:
+				writer.add_scalar("validation/cross_entropy", validation_loss, epoch + 1)
+				writer.flush()
+			logger.info("validation_complete", epoch=epoch + 1, cross_entropy=round(validation_loss, 5))
+		else:
+			logger.info("skipping validation (--no-validate)", epoch=epoch + 1)
+		save_checkpoint("last", validation_loss)
+		if args.save_best and validation_loss is not None and validation_loss < best_validation_loss:
+			best_validation_loss = validation_loss
+			save_checkpoint("best", validation_loss)
 	if writer is not None:
 		writer.close()
+	if not args.evaluate:
+		logger.info("skipping calibration and final model export ('last' checkpoint only, --no-evaluate)")
+		return []
 
 	model.eval()
 	calibration = []
@@ -573,23 +576,38 @@ def main() -> None:
 						help="write loss and GPU metrics to the run directory for TensorBoard (default: enabled)")
 	parser.add_argument("--log-every", type=int, default=10,
 						help="record TensorBoard metrics every N batches")
-	parser.add_argument("--checkpoint-every-epochs", type=int, default=1,
-						help="save a regular checkpoint every N epochs")
-	parser.add_argument("--save-best-limit", type=int, default=3,
-						help="number of checkpoints with the lowest validation loss to retain")
+	parser.add_argument("--save-best", action=argparse.BooleanOptionalAction, default=False,
+						help="also save a 'best' checkpoint (lowest validation loss) alongside 'last' (default: disabled)")
+	parser.add_argument("--validate", action=argparse.BooleanOptionalAction, default=True,
+						help="compute validation cross-entropy after each epoch (default: enabled); "
+							 "when disabled, 'best' is never saved regardless of --save-best")
+	parser.add_argument("--evaluate", action=argparse.BooleanOptionalAction, default=True,
+						help="run calibration and benchmark evaluation after training (default: enabled); "
+							 "when disabled, only the 'last' checkpoint is saved and evaluation is skipped")
+	parser.add_argument("--eval-model-dir", default=None,
+						help="skip training and only evaluate an already fine-tuned model directory "
+							 "(e.g. an output run directory or its checkpoints/last or checkpoints/best subfolder)")
 	args = parser.parse_args()
 	if args.limit is not None and args.limit < 1:
 		parser.error("--limit must be at least 1")
 	if args.log_every < 1:
 		parser.error("--log-every must be at least 1")
-	if args.checkpoint_every_epochs < 1:
-		parser.error("--checkpoint-every-epochs must be at least 1")
-	if args.save_best_limit < 1:
-		parser.error("--save-best-limit must be at least 1")
 	random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
 	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 	if device.type == "cuda":
 		torch.cuda.set_device(device.index or 0)
+
+	if args.eval_model_dir:
+		if not os.path.isdir(args.eval_model_dir):
+			raise FileNotFoundError(f"Model directory does not exist: {args.eval_model_dir}")
+		logger.info("loading dataset for evaluation...")
+		test_data = load_split(args.dataset, "test", args.limit)
+		logger.info(f"loaded {len(test_data)} test cases")
+		report = args.report or os.path.join(args.eval_model_dir, "benchmark_report.json")
+		logger.info("starting evaluation...")
+		evaluate(test_data, args.eval_model_dir, report, device)
+		return
+
 	logger.info(f"preparing model {args.model}...")
 	model_dir = snapshot_download(args.model)
 	_fix_tokenizer_config(model_dir)
@@ -615,6 +633,8 @@ def main() -> None:
 		raise FileExistsError(f"Run directory already exists: {output_dir}")
 	logger.info("starting training...")
 	temperatures = train(items, validation_items, model_dir, output_dir, args, device)
+	if not args.evaluate:
+		return
 	logger.info("calibration temperatures: %s" % [round(value, 3) for value in temperatures])
 	report = args.report or os.path.join(output_dir, "benchmark_report.json")
 	logger.info("starting evaluation...")
